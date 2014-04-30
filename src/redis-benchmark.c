@@ -77,6 +77,7 @@ static struct config {
     int dbnum;
     sds dbnumstr;
     char *tests;
+    char *auth;
 } config;
 
 typedef struct _client {
@@ -89,6 +90,9 @@ typedef struct _client {
     long long start;        /* Start time of a request */
     long long latency;      /* Request latency */
     int pending;            /* Number of pending requests (replies to consume) */
+    int authlen;    /* If non-zero, an AUTH of 'authlen' bytes is currently used
+                       as a prefix of the pipline of commands. This gets
+                       discarded the first time it's sent. */
     int selectlen;  /* If non-zero, a SELECT of 'selectlen' bytes is currently
                        used as a prefix of the pipline of commands. This gets
                        discarded the first time it's sent. */
@@ -212,6 +216,21 @@ static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
 
                 freeReplyObject(reply);
 
+                if (c->authlen) {
+                    int j;
+
+                    /* This is the OK from AUTH. Just discard the AUTH from the
+                     * buffer. */
+                    c->pending--;
+                    sdsrange(c->obuf,c->authlen,-1);
+                    /* We also need to fix the pointers to the strings
+                     * we need to randomize. */
+                    for (j = 0; j < c->randlen; j++)
+                        c->randptr[j] -= c->authlen;
+                    c->authlen = 0;
+                    continue;
+                }
+
                 if (c->selectlen) {
                     int j;
 
@@ -285,6 +304,9 @@ static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
  * again and again to send the request to the server) accordingly to the configured
  * pipeline size.
  *
+ * An AUTH command is prepended if needed. The initial AUTH will be discarded as
+ * soon as the first reply is received.
+ *
  * Also an initial SELECT command is prepended in order to make sure the right
  * database is selected, if needed. The initial SELECT will be discarded as soon
  * as the first reply is received.
@@ -325,14 +347,27 @@ static client createClient(char *cmd, size_t len, client from) {
      * the example client buffer. */
     c->obuf = sdsempty();
 
-    /* If a DB number different than zero is selected, prefix our request
-     * buffer with the SELECT command, that will be discarded the first
-     * time the replies are received, so if the client is reused the
-     * SELECT command will not be used again. */
+    /* If a Redis password is provided, prefix the request buffer with the
+      * appropriate AUTH command. The AUTH command will be discarded as soon
+      * as replies are received so that the client doesn't re-authenticate
+      * redundantly. */
+    if (config.auth != NULL) {
+        c->obuf = sdscatprintf(c->obuf,"*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n",
+            (int)sdslen(config.auth),config.auth);
+        c->authlen = sdslen(c->obuf);
+        fprintf(stderr, "authlen: %d\n", (int)sdslen(config.auth));
+    } else {
+        c->authlen = 0;
+    }
+
+    /* If a DB number different than zero is selected, prefix our request buffer
+     * with the SELECT command, that will be discarded the first time the
+     * replies are received, so if the client is reused the SELECT command will
+     * not be used again. */
     if (config.dbnum != 0) {
         c->obuf = sdscatprintf(c->obuf,"*2\r\n$6\r\nSELECT\r\n$%d\r\n%s\r\n",
             (int)sdslen(config.dbnumstr),config.dbnumstr);
-        c->selectlen = sdslen(c->obuf);
+        c->selectlen = sdslen(c->obuf) - c->authlen;
     } else {
         c->selectlen = 0;
     }
@@ -340,8 +375,9 @@ static client createClient(char *cmd, size_t len, client from) {
     /* Append the request itself. */
     if (from) {
         c->obuf = sdscatlen(c->obuf,
-            from->obuf+from->selectlen,
-            sdslen(from->obuf)-from->selectlen);
+            from->obuf+from->authlen+from->selectlen,
+            sdslen(from->obuf)-from->authlen-from->selectlen);
+        fprintf(stderr, "c->obuf: \"%s\"\n", c->obuf);
     } else {
         for (j = 0; j < config.pipeline; j++)
             c->obuf = sdscatlen(c->obuf,cmd,len);
@@ -350,6 +386,7 @@ static client createClient(char *cmd, size_t len, client from) {
     c->pending = config.pipeline;
     c->randptr = NULL;
     c->randlen = 0;
+    if (c->authlen) c->pending++;
     if (c->selectlen) c->pending++;
 
     /* Find substrings in the output buffer that need to be randomized. */
@@ -361,8 +398,8 @@ static client createClient(char *cmd, size_t len, client from) {
             /* copy the offsets. */
             for (j = 0; j < c->randlen; j++) {
                 c->randptr[j] = c->obuf + (from->randptr[j]-from->obuf);
-                /* Adjust for the different select prefix length. */
-                c->randptr[j] += c->selectlen - from->selectlen;
+                /* Adjust for the different prefix length. */
+                c->randptr[j] += ( c->authlen + c->selectlen ) - ( from->authlen + from->selectlen );
             }
         } else {
             char *p = c->obuf;
@@ -391,6 +428,13 @@ static void createMissingClients(client c) {
     int n = 0;
     char *buf = c->obuf;
     size_t buflen = sdslen(c->obuf);
+
+    /* If we are cloning from a client with an AUTH prefix, skip it since the
+     * client will be created with the prefixed AUTH if needed. */
+    if (c->authlen) {
+        buf += c->authlen;
+        buflen -= c->authlen;
+    }
 
     /* If we are cloning from a client with a SELECT prefix, skip it since the
      * client will be created with the prefixed SELECT if needed. */
@@ -489,6 +533,9 @@ int parseOptions(int argc, const char **argv) {
         } else if (!strcmp(argv[i],"-s")) {
             if (lastarg) goto invalid;
             config.hostsocket = strdup(argv[++i]);
+        } else if (!strcmp(argv[i],"-a") ) {
+            if (lastarg) goto invalid;
+            config.auth = strdup(argv[++i]);
         } else if (!strcmp(argv[i],"-d")) {
             if (lastarg) goto invalid;
             config.datasize = atoi(argv[++i]);
@@ -550,6 +597,7 @@ usage:
 " -h <hostname>      Server hostname (default 127.0.0.1)\n"
 " -p <port>          Server port (default 6379)\n"
 " -s <socket>        Server socket (overrides host and port)\n"
+" -a <password>      Password for Redis Auth\n"
 " -c <clients>       Number of parallel connections (default 50)\n"
 " -n <requests>      Total number of requests (default 10000)\n"
 " -d <size>          Data size of SET/GET value in bytes (default 2)\n"
@@ -645,6 +693,7 @@ int main(int argc, const char **argv) {
     config.hostport = 6379;
     config.hostsocket = NULL;
     config.tests = NULL;
+    config.auth = NULL;
     config.dbnum = 0;
 
     i = parseOptions(argc,argv);
